@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 
-// ── PulseNet-to-Gateway Bridge Config ─────────────────────────────────────────
-const GATEWAY_HOOK_URL = process.env.GATEWAY_HOOK_URL || 'http://127.0.0.1:18789/hooks/pulsenet';
-const GATEWAY_HOOK_TOKEN = process.env.GATEWAY_HOOK_TOKEN || process.env.PULSE_HOOK_TOKEN || '';
+// ── PulseNet-to-Gateway Bridge Config ─────────────────────────────────────────────────
+// On the PulseNet (shrimpnet) node: set PULSENET_INGEST_URL to route agent
+// replies back to PulseNet UI instead of a non-existent OpenClaw gateway.
+const PULSENET_INGEST_URL   = process.env.PULSENET_INGEST_URL   || '';
+const PULSENET_INGEST_TOKEN = process.env.PULSENET_INGEST_TOKEN || '';
+const GATEWAY_HOOK_URL      = process.env.GATEWAY_HOOK_URL      || 'http://127.0.0.1:18789/hooks/pulsenet';
+const GATEWAY_HOOK_TOKEN    = process.env.GATEWAY_HOOK_TOKEN    || process.env.PULSE_HOOK_TOKEN || '';
 
 async function forwardToGateway(msg, agentName) {
   // Only forward actual messages, not control signals
@@ -18,12 +22,46 @@ async function forwardToGateway(msg, agentName) {
 
   if (!body.trim()) return;
 
-  // Inject reply instructions so the agent knows how to respond back to PulseNet
-  const replyInstructions = `\n\n[REPLY INSTRUCTIONS: Reply back to PulseNet via: bash ~/clawd/scripts/pulsenet-send.sh ltdan "YOUR RESPONSE" --conv-id ${conversationId}\nUse the conv-id exactly as shown. Do NOT use --conv flag.]`;
+  // ── Path A: PulseNet ingest (shrimpnet node — no local OpenClaw gateway) ──
+  if (PULSENET_INGEST_URL) {
+    const ingestPayload = {
+      from: sender,
+      sender: sender,
+      sender_type: 'agent',
+      body: body,
+      conversationId: conversationId,
+    };
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (PULSENET_INGEST_TOKEN) {
+      headers['Authorization'] = `Bearer ${PULSENET_INGEST_TOKEN}`;
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      const res = await fetch(PULSENET_INGEST_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(ingestPayload),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      console.log(`[pulse-bridge:ingest] Agent reply → PulseNet ingest: ${res.status} (conv=${conversationId}, from=${sender}, len=${body.length})`);
+      return null;  // ingest is fire-and-forget (no response body to relay)
+    } catch (err) {
+      console.warn(`[pulse-bridge:ingest] PulseNet ingest failed: ${err.message} — falling through to gateway`);
+      // Fall through to gateway path as backup
+    }
+  }
+
+  // ── Path B: OpenClaw gateway hook (all other agent nodes) ──
+  // Inject reply instructions so the agent sends response back to PulseNet
+  const replyInstructions = ""; // pulsenet-relay hook handles routing automatically
   
   const hookPayload = {
     message: body + replyInstructions,
-    sessionKey: `hook:pulse:${conversationId}`,
+    sessionKey: `hook:pulsenet:${conversationId}`,
     sender: sender,
     conversationId: conversationId,
   };
@@ -67,7 +105,7 @@ async function forwardToGateway(msg, agentName) {
   }
   return null;
 }
-// ── End PulseNet-to-Gateway Bridge ────────────────────────────────────────────
+// ── End PulseNet-to-Gateway Bridge ────────────────────────────────────────────────────
 
 
 /**
@@ -704,14 +742,24 @@ export class Hub extends EventEmitter {
     // Forward to local OpenClaw gateway via hook
     const gatewayResponse = await forwardToGateway(msg, this.agentName);
     if (gatewayResponse) {
-      // Send response back through pulse to PulseNet
+      // Send response back via mesh (auto-encrypted) or legacy pulse/1.0
       const convId = msg.payload?.conversationId || msg.conversationId;
       if (convId && msg.from) {
-        await this.send(msg.from, 'message', { 
-          body: gatewayResponse, 
-          conversationId: convId,
-          sender: this.agentName,
-        }, { conversationId: convId });
+        const replyPeerAlive = this.meshRouter && this.meshPeerMgr
+          && this.meshPeerMgr.getPeer(msg.from)?.status === 'alive';
+        if (replyPeerAlive) {
+          this.meshRouter.originate({
+            to: msg.from,
+            type: 'message',
+            payload: { body: gatewayResponse, conversationId: convId, sender: this.agentName },
+          });
+        } else {
+          await this.send(msg.from, 'message', { 
+            body: gatewayResponse, 
+            conversationId: convId,
+            sender: this.agentName,
+          }, { conversationId: convId });
+        }
       }
     }
   }
@@ -1068,8 +1116,37 @@ export class Hub extends EventEmitter {
         return;
       }
 
-      const result = await this.send(to, type, payload || {}, { conversationId });
-      json(res, result);
+      // Use mesh originate for unicast (auto-encrypts via E2E)
+      // Only use mesh if the target peer is actually alive; otherwise fall through to legacy
+      const meshPeerAlive = to !== '*' && this.meshRouter && this.meshPeerMgr
+        && this.meshPeerMgr.getPeer(to)?.status === 'alive';
+      if (meshPeerAlive) {
+        // Record in conversation state before sending
+        const convId = conversationId || `conv_${uuidv4()}`;
+        const msgPayload = { ...(payload || {}), conversationId: convId };
+        const envelope = this.meshRouter.originate({
+          to,
+          type: type || 'message',
+          payload: msgPayload,
+        });
+        // Also record in local conversation log
+        const legacyMsg = {
+          protocol: 'pulse/1.0',
+          id: envelope.messageId,
+          conversationId: convId,
+          from: this.agentName,
+          to,
+          type,
+          timestamp: new Date(envelope.timestamp).toISOString(),
+          payload: payload || {},
+        };
+        await this._appendToConversation(legacyMsg);
+        json(res, { messageId: envelope.messageId, conversationId: convId, delivered: true, encrypted: envelope.type === 'encrypted' });
+      } else {
+        // Broadcast or mesh not ready — use legacy send path
+        const result = await this.send(to, type, payload || {}, { conversationId });
+        json(res, result);
+      }
       return;
     }
 
